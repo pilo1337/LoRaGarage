@@ -1,0 +1,328 @@
+/**
+ Shelly LoRa Garage
+ Binary Protocol + ACK + Retransmit
+ + Input/Relay StatusHandler
+*/
+
+const aesKey = 'CHANGEME HERE';
+const CHECKSUM_SIZE = 4;
+const DEVICE_ID = 2;
+const BRIDGE_ID = 0;
+
+// LoRa Types
+const TYPE_STATUS  = 0x01;
+const TYPE_ACK     = 0x02;
+const TYPE_COMMAND = 0x03;
+
+// Command Codes
+const CMD_ON       = 0x01;
+const CMD_OFF      = 0x02;
+const CMD_MOMENT   = 0x03;
+const CMD_GETSTAT  = 0x04;
+
+// Magic Byte
+const MagicByte    = 0xAF;
+
+// Retransmit config
+const MAX_RETRIES  = 3;
+const ACK_TIMEOUT  = 2000;
+
+let messageCounter = 0;
+let pendingAck     = null;
+let retryCount     = 0;
+let ackTimer       = null;
+let lastReceivedCounter = {};
+
+/* ============================================================
+   AES + CHECKSUM (unverändert)
+============================================================ */
+
+function encryptMessage(msg, keyHex) {
+  function fromHex(hex) {
+    const arr = new ArrayBuffer(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2)
+      arr[i / 2] = parseInt(hex.substr(i, 2), 16);
+    return arr;
+  }
+
+  function padRight(msg, blockSize) {
+    const paddingSize = (blockSize - msg.length % blockSize) % blockSize;
+    for (let i = 0; i < paddingSize; i++) msg += ' ';
+    return msg;
+  }
+
+  msg = msg.trim();
+  const formattedMsg = padRight(msg, 16);
+  const key = fromHex(keyHex);
+  return AES.encrypt(formattedMsg, key, { mode: 'ECB' });
+}
+
+function generateChecksum(msg) {
+  let checksum = 0;
+  for (let i = 0; i < msg.length; i++)
+    checksum ^= msg.charCodeAt(i);
+
+  let hexChecksum = checksum.toString(16);
+  while (hexChecksum.length < CHECKSUM_SIZE)
+    hexChecksum = '0' + hexChecksum;
+
+  return hexChecksum.slice(-CHECKSUM_SIZE);
+}
+
+function verifyMessage(message) {
+  if (message.length < CHECKSUM_SIZE + 1) return;
+
+  const receivedCheckSum = message.slice(0, CHECKSUM_SIZE);
+  const _message = message.slice(CHECKSUM_SIZE);
+
+  if (receivedCheckSum !== generateChecksum(_message)) return;
+
+  return _message;
+}
+
+function decryptMessage(buffer, keyHex) {
+  function fromHex(hex) {
+    const arr = new ArrayBuffer(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2)
+      arr[i / 2] = parseInt(hex.substr(i, 2), 16);
+    return arr;
+  }
+
+  function hex2a(hex) {
+    let str = '';
+    for (let i = 0; i < hex.length; i += 2)
+      str += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+    return str;
+  }
+
+  function toHex(buffer) {
+    let s = '';
+    for (let i = 0; i < buffer.length; i++)
+      s += (256 + buffer[i]).toString(16).substr(-2);
+    return s;
+  }
+
+  const key = fromHex(keyHex);
+  const decrypted = AES.decrypt(buffer, key, { mode: 'ECB' });
+  if (!decrypted || decrypted.byteLength === 0) return;
+
+  const hex = toHex(decrypted);
+  return verifyMessage(hex2a(hex).trim());
+}
+
+/* ============================================================
+   PROTOCOL
+============================================================ */
+
+function buildPacket(dst, type, dataByte, counterOverride) {
+  const counter = (typeof counterOverride !== "undefined")
+    ? counterOverride
+    : messageCounter;
+  return String.fromCharCode(
+    MagicByte,
+    DEVICE_ID,
+    dst,
+    counter,
+    type,
+    dataByte
+  );
+
+}
+
+function sendEncrypted(payload) {
+  const checkSumMessage = generateChecksum(payload) + payload;
+  const encryptedMessage = encryptMessage(checkSumMessage, aesKey);
+
+  Shelly.call("Lora.SendBytes", {
+    id: 100,
+    data: btoa(encryptedMessage)
+  });
+}
+
+/* ============================================================
+   RETRANSMIT LOGIC
+============================================================ */
+
+function sendWithRetry(payload) {
+
+  pendingAck = messageCounter;
+  retryCount = 0;
+
+function attemptSend() {
+
+  if (pendingAck === null) return;
+
+  sendEncrypted(payload);
+  retryCount++;
+
+  ackTimer = Timer.set(ACK_TIMEOUT, false, function () {
+
+    if (pendingAck === null) return;
+
+    if (retryCount < MAX_RETRIES) {
+      attemptSend();
+    } else {
+      pendingAck = null;
+    }
+  });
+}
+
+  attemptSend();
+}
+
+/* ============================================================
+   STATUS BUILD
+============================================================ */
+
+function buildStatusAndSend(dst) {
+
+  Shelly.call("Input.GetStatus", {id:0}, function(inputRes) {
+    Shelly.call("Switch.GetStatus", {id:0}, function(relayRes) {
+
+      let inputState = inputRes.state === true;
+      let relayState = relayRes.output === true;
+
+      let dataByte = 0;
+      if (inputState) dataByte |= 0x01;
+      if (relayState) dataByte |= 0x02;
+
+      messageCounter = (messageCounter + 1) & 0xFF;
+
+      const payload = buildPacket(dst, TYPE_STATUS, dataByte);
+      sendWithRetry(payload);
+      
+      console.log("status sent: input "+inputState+", output "+relayState);
+
+    });
+  });
+}
+
+/* ============================================================
+   STATUS HANDLER (JETZT INTEGRIERT)
+============================================================ */
+
+Shelly.addStatusHandler(function (e) {
+
+  // INPUT Änderung
+  if (e.component === "input:0" &&
+      e.delta &&
+      typeof e.delta.state === "boolean") {
+    buildStatusAndSend(BRIDGE_ID);
+    return;
+  }
+
+  // RELAY Änderung
+  if (e.component === "switch:0" &&
+      e.delta &&
+      typeof e.delta.output === "boolean") {
+    buildStatusAndSend(BRIDGE_ID);
+    return;
+  }
+});
+
+/* ============================================================
+   RECEIVE
+============================================================ */
+
+Shelly.addEventHandler(function (event) {
+
+  if (event.name !== 'lora' || !event.info || !event.info.data)
+    return;
+
+  let rssi = event.info.rssi || 0;
+  let snr  = event.info.snr || 0;
+  
+  const encryptedMsg = atob(event.info.data);
+  const decryptedMessage = decryptMessage(encryptedMsg, aesKey);
+  if (!decryptedMessage) {
+    return;
+  }
+  if (decryptedMessage.length < 6) {
+    console.log("Message too short: "+decryptedMessage);
+    return;
+  }
+  
+  if (decryptedMessage.charCodeAt(0) !== MagicByte) {
+    console.log("got lora packet, but no MagicByte: "+decryptedMessage);
+    return;
+  }
+
+  
+  const src  = decryptedMessage.charCodeAt(1);
+  const dst     = decryptedMessage.charCodeAt(2);
+  const counter = decryptedMessage.charCodeAt(3);
+  const type    = decryptedMessage.charCodeAt(4);
+  const data    = decryptedMessage.charCodeAt(5);
+
+  //console.log("got lora message with counter "+counter+" from "+src+" for "+dst+" type "+type+" data "+data+" rssi "+rssi+" snr "+snr);
+  
+  if (dst !== DEVICE_ID && dst != 0xFF) return;
+  
+  /* ---------- ACK ---------- */
+  if (type === TYPE_ACK && dst === DEVICE_ID) {
+    if (pendingAck === counter) {
+      pendingAck = null;
+      if (ackTimer) {
+        Timer.clear(ackTimer);
+        ackTimer = null;
+      }
+    }
+    console.log("ACK from "+src+" for "+counter+" RSSI "+rssi+" , SNR "+snr);
+    return;
+  }
+
+  /* ---------- COMMAND ---------- */
+
+  if (type === TYPE_COMMAND) {
+
+    if (lastReceivedCounter[src] === counter) {
+      // Nur ACK erneut senden, aber Command NICHT nochmal ausführen
+      if (dst != 0xFF) {
+      const ackPayload = buildPacket(src, TYPE_ACK, 0x00, counter);
+      sendEncrypted(ackPayload);
+      }
+      return;
+    }
+
+  lastReceivedCounter[src] = counter;
+  
+    if (data === CMD_ON) {
+      Shelly.call("Switch.Set", { id: 0, on: true });
+      console.log("switched on");
+      }
+
+    if (data === CMD_OFF) {
+      Shelly.call("Switch.Set", { id: 0, on: false });
+      console.log("switched off");
+      }
+    if (data === CMD_MOMENT) {
+      Shelly.call("Switch.Set", { id: 0, on: true, toggle_after:1 });
+      console.log("switched momentary");
+      }
+    if (data === CMD_GETSTAT) {
+      const delay = Math.random() * 800 + (dst === 0xFF ? 0 : 0);
+      Timer.set(delay, false, function(){
+      buildStatusAndSend(src);
+      });
+      console.log("status request");
+      return;
+    }
+    // ACK zurück (ohne Retry)
+    if (dst !== 0xFF) {
+    const ackPayload = buildPacket(src, TYPE_ACK, 0x00, counter);
+    sendEncrypted(ackPayload);
+    }
+  }
+});
+
+/* ============================================================
+   PERIODIC STATUS
+============================================================ */
+
+Timer.set(
+  60000 + Math.random()*2000,
+  true,
+  function () {
+  buildStatusAndSend(BRIDGE_ID);
+  }
+);
